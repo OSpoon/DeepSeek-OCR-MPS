@@ -1,4 +1,5 @@
 import logging
+import os
 
 import torch
 from transformers import AutoModel, AutoTokenizer  # type: ignore
@@ -23,7 +24,7 @@ model = model.eval().to(device).to(torch.float32)
 # prompt = "<image>\nFree OCR. "
 prompt = "<image>\n<|grounding|>Convert the document to markdown. "
 image_file = "./formula.jpg"
-output_path = "./output"
+output_path = "./examples"
 
 
 # infer(self, tokenizer, prompt='', image_file='', output_path = ' ', base_size = 1024, image_size = 640, crop_mode = True, test_compress = False, save_results = False):
@@ -34,6 +35,11 @@ output_path = "./output"
 # Large: base_size = 1280, image_size = 1280, crop_mode = False
 
 # Gundam: base_size = 1024, image_size = 640, crop_mode = True
+
+
+if not os.path.exists("examples"):
+    os.makedirs("examples")
+logger.info("Starting inference...")
 
 res = model.infer(
     tokenizer,
@@ -47,4 +53,3 @@ res = model.infer(
     test_compress=True,
 )
 logger.info("Inference completed.")
-logger.info(f"Generated text: {res}")

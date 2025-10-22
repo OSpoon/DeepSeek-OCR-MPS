@@ -1,16 +1,14 @@
 import logging
 import os
-import re  # Import thư viện regular expression
 import tempfile
 
 import gradio as gr  # type: ignore
 import torch
-from PIL import Image, ImageDraw
+from PIL import Image
 from transformers import AutoModel, AutoTokenizer  # type: ignore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 
 logger.info("Loading model and tokenizer...")
 
@@ -20,165 +18,153 @@ device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 logger.info(f"Using device: {device}")
 
 tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-# Load the model to CPU first; it will be moved to GPU during processing
 model = AutoModel.from_pretrained(
     model_name,
-    _attn_implementation="eager",
+    attn_implementation="eager",  # Mac/MPS 必须用 eager
     trust_remote_code=True,
     use_safetensors=True,
 )
-model = model.eval()
-logger.info("✅ Model loaded successfully.")
+# 启动时就把模型移到 MPS/CPU 并转换为 float32，避免每次请求重复加载
+model = model.eval().to(device).to(torch.float32)
+logger.info("✅ Model loaded successfully and moved to %s.", device)
 
 
-# --- Helper function to find pre-generated result images ---
-def find_result_image(path: str) -> Image.Image | None:
-    for filename in os.listdir(path):
-        if "grounding" in filename or "result" in filename:
-            try:
-                image_path = os.path.join(path, filename)
-                return Image.open(image_path)
-            except Exception as e:
-                logger.error(f"Error opening result image {filename}: {e}")
-    return None
-
-
-# --- 2. Main Processing Function (UPDATED for multi-bbox drawing) ---
+# --- 2. Main Processing Function (完善后版本：结合简洁输出 + 多任务 + 边界框绘制) ---
 def process_ocr_task(
-    image: Image.Image, model_size: str, task_type: str, ref_text: str
-) -> tuple[str, Image.Image | None]:
+    image: Image.Image,
+    model_size: str,
+    task_type: str,
+    ref_text: str,
+    is_eval_mode: bool,
+) -> tuple[Image.Image | None, str, str]:
     """
-    Processes an image with DeepSeek-OCR for all supported tasks.
-    Now draws ALL detected bounding boxes for ANY task.
+    处理图像并返回多种输出格式：
+    - 带边界框的标注图像（若检测到坐标）
+    - Markdown 内容（若任务生成）
+    - 纯文本 OCR 结果
     """
     if image is None:
-        return "Please upload an image first.", None
+        return None, "Please upload an image first.", "Please upload an image first."
 
-    logger.info("🚀 Moving model to MPS...")
-    model_mps = model.eval().to(device).to(torch.float32)
-    logger.info("✅ Model is on MPS.")
+    try:
+        logger.info("🚀 Running inference on %s...", device)
+        # 模型已在启动时移到 device，直接使用
 
-    with tempfile.TemporaryDirectory() as output_path:
-        # Build the prompt... (same as before)
-        if task_type == "📝 Free OCR":
-            prompt = "<image>\nFree OCR."
-        elif task_type == "📄 Convert to Markdown":
-            prompt = "<image>\n<|grounding|>Convert the document to markdown."
-        elif task_type == "📈 Parse Figure":
-            prompt = "<image>\nParse the figure."
-        elif task_type == "🔍 Locate Object by Reference":
-            if not ref_text or ref_text.strip() == "":
-                raise gr.Error(
-                    "For the 'Locate' task, you must provide the reference text to find!"
+        with tempfile.TemporaryDirectory() as output_path:
+            # 根据任务类型设置 prompt
+            if task_type == "📝 Free OCR":
+                prompt = "<image>\nFree OCR."
+            elif task_type == "📄 Convert to Markdown":
+                prompt = "<image>\n<|grounding|>Convert the document to markdown."
+            elif task_type == "📈 Parse Figure":
+                prompt = "<image>\nParse the figure."
+            elif task_type == "🔍 Locate Object by Reference":
+                if not ref_text or ref_text.strip() == "":
+                    return (
+                        None,
+                        "❌ Reference text is required for Locate task.",
+                        "❌ Reference text is required for Locate task.",
+                    )
+                prompt = (
+                    f"<image>\nLocate <|ref|>{ref_text.strip()}<|/ref|> in the image."
                 )
-            prompt = f"<image>\nLocate <|ref|>{ref_text.strip()}<|/ref|> in the image."
-        else:
-            prompt = "<image>\nFree OCR."
+            else:
+                prompt = "<image>\nFree OCR."
 
-        temp_image_path = os.path.join(output_path, "temp_image.png")
-        image.save(temp_image_path)
+            # 保存上传的图像
+            temp_image_path = os.path.join(output_path, "temp_image.png")
+            image.save(temp_image_path)
 
-        # Configure model size... (same as before)
-        size_configs = {
-            "Tiny": {"base_size": 512, "image_size": 512, "crop_mode": False},
-            "Small": {"base_size": 640, "image_size": 640, "crop_mode": False},
-            "Base": {"base_size": 1024, "image_size": 1024, "crop_mode": False},
-            "Large": {"base_size": 1280, "image_size": 1280, "crop_mode": False},
-            "Gundam (Recommended)": {
-                "base_size": 1024,
-                "image_size": 640,
-                "crop_mode": True,
-            },
-        }
-        config = size_configs.get(model_size, size_configs["Gundam (Recommended)"])
+            # 配置模型尺寸参数
+            size_configs = {
+                "Tiny": {"base_size": 512, "image_size": 512, "crop_mode": False},
+                "Small": {"base_size": 640, "image_size": 640, "crop_mode": False},
+                "Base": {"base_size": 1024, "image_size": 1024, "crop_mode": False},
+                "Large": {"base_size": 1280, "image_size": 1280, "crop_mode": False},
+                "Gundam (Recommended)": {
+                    "base_size": 1024,
+                    "image_size": 640,
+                    "crop_mode": True,
+                },
+            }
+            config = size_configs.get(model_size, size_configs["Gundam (Recommended)"])
 
-        logger.info(f"🏃 Running inference with prompt: {prompt}")
-        text_result = model_mps.infer(
-            tokenizer,
-            prompt=prompt,
-            image_file=temp_image_path,
-            output_path=output_path,
-            base_size=config["base_size"],
-            image_size=config["image_size"],
-            crop_mode=config["crop_mode"],
-            save_results=True,
-            test_compress=True,
-            eval_mode=True,
-        )
+            logger.info("🏃 Running inference with prompt: %s", prompt)
+            plain_text_result = model.infer(
+                tokenizer,
+                prompt=prompt,
+                image_file=temp_image_path,
+                output_path=output_path,
+                base_size=config["base_size"],
+                image_size=config["image_size"],
+                crop_mode=config["crop_mode"],
+                save_results=True,
+                test_compress=True,
+                eval_mode=is_eval_mode,
+            )
 
-        logger.info(f"====\n📄 Text Result: {text_result}\n====")
-
-        # --- NEW LOGIC: Always try to find and draw all bounding boxes ---
-        result_image_pil = None
-
-        # Define the pattern to find all coordinates like [[280, 15, 696, 997]]
-        pattern = re.compile(
-            r"<\|det\|>\[\[(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\]\]<\|/det\|>"
-        )
-        matches = list(pattern.finditer(text_result))  # Use finditer to get all matches
-
-        if matches:
             logger.info(
-                f"✅ Found {len(matches)} bounding box(es). Drawing on the original image."
+                "📄 Text result (length=%d)",
+                len(plain_text_result) if plain_text_result else 0,
             )
 
-            # Create a copy of the original image to draw on
-            image_with_bboxes = image.copy()
-            draw = ImageDraw.Draw(image_with_bboxes)
-            w, h = image.size  # Get original image dimensions
+            # 读取生成的 markdown 文件（如果存在）
+            markdown_result_path = os.path.join(output_path, "result.mmd")
+            markdown_content = ""
+            if os.path.exists(markdown_result_path):
+                with open(markdown_result_path, encoding="utf-8") as f:
+                    markdown_content = f.read()
+            else:
+                markdown_content = "Markdown result was not generated. This is expected for 'Free OCR' task."
 
-            for match in matches:
-                # Extract coordinates as integers
-                coords_norm = [int(c) for c in match.groups()]
-                x1_norm, y1_norm, x2_norm, y2_norm = coords_norm
+            # 读取模型自动生成的标注图像（若存在）
+            result_image_pil = None
+            image_result_path = os.path.join(output_path, "result_with_boxes.jpg")
+            if os.path.exists(image_result_path):
+                result_image_pil = Image.open(image_result_path)
+                result_image_pil.load()
+                logger.info("✅ Found annotated image: %s", image_result_path)
+            else:
+                logger.info("ℹ️ No annotated image generated (expected for some tasks).")
 
-                # Scale the normalized coordinates (from 1000x1000 space) to the image's actual size
-                x1 = int(x1_norm / 1000 * w)
-                y1 = int(y1_norm / 1000 * h)
-                x2 = int(x2_norm / 1000 * w)
-                y2 = int(y2_norm / 1000 * h)
+            # 返回三个输出：标注图像、Markdown 预览内容、纯文本结果
+            text_result = plain_text_result if plain_text_result else markdown_content
+            return result_image_pil, markdown_content, text_result
 
-                # Draw the rectangle with a red outline, 3 pixels wide
-                draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
-
-            result_image_pil = image_with_bboxes
-        else:
-            # If no coordinates are found in the text, fall back to finding a pre-generated image
-            logger.warning(
-                "⚠️ No bounding box coordinates found in text result. Falling back to search for a result image file."
-            )
-            result_image_pil = find_result_image(output_path)
-
-        return text_result, result_image_pil
+    except Exception as e:
+        logger.exception("❌ Inference failed")
+        error_msg = f"ERROR: {e}"
+        return None, error_msg, error_msg
 
 
-# --- 3. Build the Gradio Interface (UPDATED) ---
-with gr.Blocks(title="🐳DeepSeek-OCR🐳", theme=gr.themes.Soft()) as demo:
+# --- 3. Build the Gradio Interface (完善后版本：Tab 展示 + eval_mode 控制) ---
+with gr.Blocks(title="🐳 DeepSeek-OCR", theme=gr.themes.Soft()) as demo:
     gr.Markdown(
         """
-        # DeepSeek-OCR
+        # 🐳 DeepSeek-OCR Demo (Mac/MPS 适配版)
 
-        **💡 How to use:**
-        1.  **Upload an image** using the upload box.
-        2.  Select a **Resolution**. `Gundam` is recommended for most documents.
-        3.  Choose a **Task Type**:
-            - **📝 Free OCR**: Extracts raw text from the image.
-            - **📄 Convert to Markdown**: Converts the document into Markdown, preserving structure.
-            - **📈 Parse Figure**: Extracts structured data from charts and figures.
-            - **🔍 Locate Object by Reference**: Finds a specific object/text.
+        **💡 使用说明：**
+        1. **上传图片** 到上传框。
+        2. 选择 **分辨率**。推荐使用 `Gundam` 以获得文档最佳效果。
+        3. 选择 **任务类型**：
+            - **📝 Free OCR**：提取原始文本
+            - **📄 Convert to Markdown**：转换为 Markdown 格式（保留结构）
+            - **📈 Parse Figure**：提取图表结构化数据
+            - **🔍 Locate Object by Reference**：定位特定对象/文本（需填写参考文本）
+        4. 可选：勾选 **Evaluation Mode** 以仅返回纯文本（可能更快，但不生成标注图像和 Markdown）。
         """
     )
 
     with gr.Row():
         with gr.Column(scale=1):
-            image_input = gr.Image(
-                type="pil", label="🖼️ Upload Image", sources=["upload", "clipboard"]
-            )
+            image_input = gr.Image(type="pil", label="🖼️ 上传图片")
+
             model_size = gr.Dropdown(
                 choices=["Tiny", "Small", "Base", "Large", "Gundam (Recommended)"],
                 value="Gundam (Recommended)",
-                label="⚙️ Resolution Size",
+                label="⚙️ 分辨率大小",
             )
+
             task_type = gr.Dropdown(
                 choices=[
                     "📝 Free OCR",
@@ -187,22 +173,40 @@ with gr.Blocks(title="🐳DeepSeek-OCR🐳", theme=gr.themes.Soft()) as demo:
                     "🔍 Locate Object by Reference",
                 ],
                 value="📄 Convert to Markdown",
-                label="🚀 Task Type",
+                label="🚀 任务类型",
             )
+
             ref_text_input = gr.Textbox(
-                label="📝 Reference Text (for Locate task)",
-                placeholder="e.g., the teacher, 20-10, a red car...",
+                label="📝 参考文本（用于 Locate 任务）",
+                placeholder="例如: the teacher, 20-10, a red car...",
                 visible=False,
             )
-            submit_btn = gr.Button("Process Image", variant="primary")
+
+            eval_mode_checkbox = gr.Checkbox(
+                value=False,
+                label="启用 Evaluation Mode",
+                info="仅返回纯文本，可能更快。取消勾选可获得标注图像和 Markdown。",
+            )
+
+            submit_btn = gr.Button("🚀 处理图片", variant="primary")
 
         with gr.Column(scale=2):
-            output_text = gr.Textbox(
-                label="📄 Text Result", lines=15, show_copy_button=True
-            )
-            output_image = gr.Image(label="🖼️ Image Result (if any)", type="pil")
+            with gr.Tabs():
+                with gr.TabItem("📷 标注图像"):
+                    output_image = gr.Image(
+                        interactive=False, label="带边界框的图像（如有检测到）"
+                    )
+                with gr.TabItem("📝 Markdown 预览"):
+                    output_markdown = gr.Markdown(label="Markdown 渲染预览")
+                with gr.TabItem("📄 Markdown 源码 / 纯文本输出"):
+                    output_text = gr.Textbox(
+                        lines=20,
+                        show_copy_button=True,
+                        interactive=False,
+                        label="纯文本结果或 Markdown 源码",
+                    )
 
-    # --- UI Interaction Logic ---
+    # --- UI 交互逻辑：根据任务类型显示/隐藏参考文本框 ---
     def toggle_ref_text_visibility(task: str) -> gr.Textbox:
         return (
             gr.Textbox(visible=True)
@@ -213,10 +217,11 @@ with gr.Blocks(title="🐳DeepSeek-OCR🐳", theme=gr.themes.Soft()) as demo:
     task_type.change(
         fn=toggle_ref_text_visibility, inputs=task_type, outputs=ref_text_input
     )
+
     submit_btn.click(
         fn=process_ocr_task,
-        inputs=[image_input, model_size, task_type, ref_text_input],
-        outputs=[output_text, output_image],
+        inputs=[image_input, model_size, task_type, ref_text_input, eval_mode_checkbox],
+        outputs=[output_image, output_markdown, output_text],
     )
 
 # --- 4. Launch the App ---
